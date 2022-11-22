@@ -26,8 +26,7 @@ jobs:
           - nightly
         os:
           - ubuntu-latest
-          # See issue https://github.com/revault/liana/issues/69
-          #- macOS-latest
+          - macOS-latest
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
