@@ -12,7 +12,7 @@ exclude = [".github/", ".cirrus.yml", "tests/",  "test_data/", "contrib/", "pypr
 [[bin]]
 name = "lianad"
 path = "src/bin/daemon.rs"
-required-features = ["jsonrpc_server"]
+required-features = ["jsonrpc_server", "daemon"]
 
 [[bin]]
 name = "liana-cli"
@@ -20,8 +20,9 @@ path = "src/bin/cli.rs"
 required-features = ["jsonrpc_server"]
 
 [features]
-default = ["jsonrpc_server"]
+default = ["jsonrpc_server", "daemon"]
 jsonrpc_server = []
+daemon = ["libc"]
 
 [dependencies]
 # For managing transactions (it re-exports the bitcoin crate)
@@ -53,7 +54,7 @@ rusqlite = { version = "0.26.3", features = ["bundled", "unlock_notify"] }
 jsonrpc = "0.12"
 
 # Used for daemonization
-libc = "0.2"
+libc = { version = "0.2", optional = true }
 
 # Used for PSBTs
 base64 = "0.13"
