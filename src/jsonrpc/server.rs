@@ -396,8 +396,6 @@ mod tests {
         fs::remove_file(&socket_path).unwrap();
     }
 
-    // TODO: debug on MacOS
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn server_sanity_check() {
         let ms = DummyLiana::new(DummyBitcoind::new(), DummyDatabase::new());
