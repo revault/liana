@@ -32,16 +32,41 @@ maybe_create_dir "$BIN_DIR"
 # That's what Guix comes with.
 RUST_VERSION="1.60.0"
 CARGO_BIN="$BIN_DIR/cargo"
+MUSL_STDLIB="$BIN_DIR/musl_stdlib"
+MUSL_RUSTC_DIR="$BIN_DIR/musl_rustc"
 
 # First off get the cargo binary to run on the host to vendor dependencies.
 # We assume the host is a 64bit Linux system.
 if ! [ -f "$CARGO_BIN" ]; then
-    ARCHIVE_PATH="$BIN_DIR/rust-for-cargo.tar.gz"
+    test -f "$ARCHIVE_PATH" || ARCHIVE_PATH="$BIN_DIR/rust-for-cargo.tar.gz"
     curl -o "$ARCHIVE_PATH" "https://static.rust-lang.org/dist/rust-$RUST_VERSION-x86_64-unknown-linux-gnu.tar.gz"
     echo "b8a4c3959367d053825e31f90a5eb86418eb0d80cacda52bfa80b078e18150d5 $ARCHIVE_PATH" | $SHASUM_BIN -c
     # Path of the cargo binary within the archive
     CARGO_BIN_PATH="rust-$RUST_VERSION-x86_64-unknown-linux-gnu/cargo/bin/cargo"
     ( cd $BIN_DIR && tar -xzf $ARCHIVE_PATH $CARGO_BIN_PATH && mv $CARGO_BIN_PATH $CARGO_BIN )
+fi
+
+# Then get the Rust stdlib for musl.
+if ! [ -d "$MUSL_STDLIB" ] || ! [ -f "$MUSL_RUSTC_DIR" ]; then
+    ARCHIVE_PATH="$BIN_DIR/rust-for-musl.tar.gz"
+    test -f "$ARCHIVE_PATH" || curl -o "$ARCHIVE_PATH" "https://static.rust-lang.org/dist/rust-$RUST_VERSION-x86_64-unknown-linux-musl.tar.gz"
+    #echo "b8a4c3959367d053825e31f90a5eb86418eb0d80cacda52bfa80b078e18150d5 $ARCHIVE_PATH" | $SHASUM_BIN -c
+    # Path of the compiled stdlib within the archive
+    STDLIB_PATH="rust-$RUST_VERSION-x86_64-unknown-linux-musl/rust-std-x86_64-unknown-linux-musl/lib/rustlib/x86_64-unknown-linux-musl/lib/"
+    RUSTC_DIR_PATH="rust-$RUST_VERSION-x86_64-unknown-linux-musl/rustc"
+    (
+        cd "$BIN_DIR"
+        if ! [ -d "$MUSL_STDLIB" ]; then
+            tar -xzf "$ARCHIVE_PATH" "$STDLIB_PATH"
+            mv "$STDLIB_PATH" "$MUSL_STDLIB"
+        fi
+        if ! [ -d "$MUSL_RUSTC_DIR" ]; then
+            tar -xzf "$ARCHIVE_PATH" "$RUSTC_DIR_PATH"
+            mv "$RUSTC_DIR_PATH" "$MUSL_RUSTC_DIR"
+        fi
+    )
+    ls
+    ls $MUSL_RUSTC_DIR
 fi
 
 # Execute "$@" in a pinned, possibly older version of Guix, for reproducibility
@@ -55,85 +80,90 @@ time_machine() {
                       -- "$@"
 }
 
-# Build both the daemon (at the root of the repository) and the GUI (in gui/)
-for project_folder in "" "gui"; do
-    PROJECT_ROOT="$PWD/$project_folder"
-    PROJECT_VENDOR_DIR="$VENDOR_DIR/$project_folder"
-    PROJECT_OUT_DIR="$OUT_DIR/$project_folder"
-    PROJECT_PATCHES_ROOT="$PWD/contrib/reproducible/guix/patches/$project_folder"
+# Now build the daemon.
 
-    project_needs_patches() {
-        test $(ls -A1q "$PROJECT_PATCHES_ROOT" |grep patch)
-    }
+# Start by pulling the dependencies, we'll build them in the container.
+test -d "$VENDOR_DIR" || $CARGO_BIN vendor "$VENDOR_DIR"
 
-    maybe_create_dir "$PROJECT_OUT_DIR"
+# Bootstrap a reproducible environment as specified by the manifest in an isolated
+# container, and build the project.
+IS_GUI=0 time_machine shell --no-cwd \
+           --expose="$PWD/src=/liana/src" \
+           --expose="$PWD/Cargo.toml=/liana/Cargo.toml" \
+           --expose="$PWD/Cargo.lock=/liana/Cargo.lock" \
+           --expose="$PWD/contrib/reproducible/guix/build.sh=/liana/build.sh" \
+           --expose="$MUSL_STDLIB=/liana/musl_stdlib" \
+           --expose="$MUSL_RUSTC_DIR=/liana/musl_rustc" \
+           --expose="$VENDOR_DIR=/vendor" \
+           --share="$OUT_DIR=/out" \
+           --cores="$JOBS" \
+           --container \
+           --pure \
+           --fallback \
+           --rebuild-cache \
+           -m "$PWD/contrib/reproducible/guix/manifest.scm" \
+           -- env CC=gcc VENDOR_DIR="$VENDOR_DIR" TARGET_DIR="$OUT_DIR" BINARY_NAME="lianad" JOBS="$JOBS" \
+              /bin/sh -c "cd /liana && ./build.sh"
 
-    # Pull the sources of our dependencies before building them in the container.
-    if ! [ -d "$PROJECT_VENDOR_DIR" ]; then
-        # Download the dependencies
-        ( cd "$project_folder" && $CARGO_BIN vendor "$PROJECT_VENDOR_DIR" )
+# Now build the GUI.
+GUI_ROOT_DIR="$PWD/gui"
+GUI_VENDOR_DIR="$VENDOR_DIR/gui"
+GUI_OUT_DIR="$OUT_DIR/gui"
+GUI_PATCHES_DIR="$PWD/contrib/reproducible/guix/patches/gui"
 
-        # Patch some dependencies sources if needed for this project
-        if project_needs_patches; then
-            (
-                cd "$PROJECT_VENDOR_DIR"
-                for patch_file in $(ls "$PROJECT_PATCHES_ROOT"); do
-                    patch -p1 < "$PROJECT_PATCHES_ROOT/$patch_file"
-                done
-            )
+# Again, start by vendoring the dependencies. But in addition here the GUI sources need to
+# be patched in order to be able to build it with the current Rust version (its MSRV is insane).
+if ! [ -d "$GUI_VENDOR_DIR" ]; then
+    # Download the dependencies
+    ( cd "./gui" && $CARGO_BIN vendor "$GUI_VENDOR_DIR" )
 
-            # Some of the checksums will be incorrect. Instead of cherry-picking remove them
-            # altogether, since they aren't useful anyways (see comment below).
-            for dep in $(ls "$PROJECT_VENDOR_DIR"); do
-                echo "{\"files\":{}}" > "$PROJECT_VENDOR_DIR/$dep/.cargo-checksum.json"
-            done
-        fi
-    fi
+    # Patch the dependencies as needed.
+    (
+        cd "$GUI_VENDOR_DIR"
+        for patch_file in $(ls "$GUI_PATCHES_DIR"); do
+            patch -p1 < "$GUI_PATCHES_DIR/$patch_file"
+        done
+    )
 
-    cp "$PROJECT_ROOT/Cargo.lock" "$BUILD_ROOT/Cargo.lock"
-    if project_needs_patches; then
-        # Remove the checksums from the Cargo.lock. In the container `cargo rustc` would compare
-        # them against the .cargo-checksum.json to make sure they weren't tampered with since they
-        # where vendored. But we just removed the checksums from the .cargo-checksum.json.
-        # There is little point in checking integrity between the above vendor step and now anyways.
-        # What matters is checking integrity after downloading the crates from the internet and
-        # `cargo vendor` does that already.
-        sed -i '/checksum/d' "$BUILD_ROOT/Cargo.lock"
-    fi
+    # Some of the checksums will be incorrect. Instead of cherry-picking remove them
+    # altogether, since they aren't useful anyways (see comment below).
+    for dep in $(ls "$GUI_VENDOR_DIR"); do
+        echo "{\"files\":{}}" > "$GUI_VENDOR_DIR/$dep/.cargo-checksum.json"
+    done
+fi
 
-    # FIXME: find a cleaner way to get the binary name, or get rid of patchelf entirely
-    # Note: we also rely on it in manifest.scm
-    if [ "$project_folder" = "" ]; then
-        BINARY_NAME="lianad"
-    elif [ "$project_folder" = "gui" ]; then
-        BINARY_NAME="liana-gui"
-    else
-        echo "Can't determine binary name"
-        exit 1
-    fi
+# Remove the checksums from the Cargo.lock. In the container `cargo rustc` would compare
+# them against the .cargo-checksum.json to make sure they weren't tampered with since they
+# where vendored. But we just removed the checksums from the .cargo-checksum.json.
+# There is little point in checking integrity between the above vendor step and now anyways.
+# What matters is checking integrity after downloading the crates from the internet and
+# `cargo vendor` does that already.
+cp "$GUI_ROOT_DIR/Cargo.lock" "$BUILD_ROOT/Cargo.lock"
+sed -i '/checksum/d' "$BUILD_ROOT/Cargo.lock"
 
-    # Bootstrap a reproducible environment as specified by the manifest in an isolated
-    # container, and build the project.
-    # NOTE: it looks like "--rebuild-cache" is necessary for the BINARY_NAME variable to
-    # be taken into account when building the container (otherwise the GUI container could
-    # miss some dependencies).
-    BINARY_NAME="$BINARY_NAME" time_machine shell --no-cwd \
-               --expose="$PROJECT_ROOT/src=/liana/src" \
-               --expose="$PWD/gui/static=/liana/static" \
-               --expose="$PROJECT_ROOT/Cargo.toml=/liana/Cargo.toml" \
-               --expose="$BUILD_ROOT/Cargo.lock=/liana/Cargo.lock" \
-               --expose="$PWD/contrib/reproducible/guix/build.sh=/liana/build.sh" \
-               --expose="$PROJECT_VENDOR_DIR=/vendor" \
-               --share="$PROJECT_OUT_DIR=/out" \
-               --cores="$JOBS" \
-               --container \
-               --pure \
-               --fallback \
-               --rebuild-cache \
-               -m $PWD/contrib/reproducible/guix/manifest.scm \
-               -- env CC=gcc VENDOR_DIR="$PROJECT_VENDOR_DIR" TARGET_DIR="$PROJECT_OUT_DIR" BINARY_NAME="$BINARY_NAME" JOBS="$JOBS" \
-                  /bin/sh -c "cd /liana && ./build.sh"
-done
+# Bootstrap a reproducible environment as specified by the manifest in an isolated
+# container, and build the project.
+# NOTE: it looks like "--rebuild-cache" is necessary for the BINARY_NAME variable to
+# be taken into account when building the container (otherwise the GUI container could
+# miss some dependencies).
+IS_GUI=1 time_machine shell --no-cwd \
+           --expose="$GUI_ROOT_DIR/src=/liana/src" \
+           --expose="$GUI_ROOT_DIR/static=/liana/static" \
+           --expose="$GUI_ROOT_DIR/Cargo.toml=/liana/Cargo.toml" \
+           --expose="$BUILD_ROOT/Cargo.lock=/liana/Cargo.lock" \
+           --expose="$MUSL_STDLIB=/liana/musl_stdlib" \
+           --expose="$PWD/contrib/reproducible/guix/build.sh=/liana/build.sh" \
+           --expose="$GUI_VENDOR_DIR=/vendor" \
+           --share="$GUI_OUT_DIR=/out" \
+           --cores="$JOBS" \
+           --container \
+           --pure \
+           --fallback \
+           --rebuild-cache \
+           -m "$PWD/contrib/reproducible/guix/manifest.scm" \
+           -- env CC=gcc VENDOR_DIR="$GUI_VENDOR_DIR" TARGET_DIR="$GUI_OUT_DIR" BINARY_NAME="liana-gui" JOBS="$JOBS" \
+              /bin/sh -c "cd /liana && ./build.sh"
+
 
 set +ex
 
